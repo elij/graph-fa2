@@ -1,7 +1,7 @@
 ;;; graph-fa2.el --- ForceAtlas2 pure-elisp background-cached engine -*- lexical-binding: t -*-
 
 ;; Author: Elijah Charles
-;; Version: 0.0.3
+;; Version: 0.0.5
 
 (eval-when-compile
   (when (boundp 'comp-speed)
@@ -88,6 +88,9 @@ Each function must accept one argument: the node identifier, or nil if cleared."
 
 (defvar-local graph-fa2--zoom-timer nil
   "Timer object for the inertial zoom animation.")
+
+(defvar-local graph-fa2--render-state nil
+  "Tracks the parameters of the last render to prevent double rendering.")
 
 (defconst graph-fa2--substeps 10
   "The number of physics substeps per frame.")
@@ -247,9 +250,9 @@ The updated SVG XML string."
       (let* ((node-block (substring svg-string start-pos text-end))
              (circle-repl (format "<circle cx=\"%.2f\" cy=\"%.2f\"" new-cx new-cy))
              (updated-block (replace-regexp-in-string "<circle cx=\"[0-9.-]+\" cy=\"[0-9.-]+\"" circle-repl node-block t t))
-             (updated-block (replace-regexp-in-string "x=\"[0-9.-]+\"" (format "x=\"%.2f\"" new-cx) updated-block t t))
+             (updated-block (replace-regexp-in-string "\\bx=\"[0-9.-]+\"" (format "x=\"%.2f\"" new-cx) updated-block t t))
              (pos 0))
-        (while (string-match "y=\"\\([0-9.-]+\\)\"" updated-block pos)
+        (while (string-match "\\by=\"\\([0-9.-]+\\)\"" updated-block pos)
           (let* ((old-y (string-to-number (match-string 1 updated-block)))
                  (new-y (+ old-y dy))
                  (replacement (format "y=\"%.2f\"" new-y)))
@@ -262,6 +265,7 @@ The updated SVG XML string."
 
 (defun graph-fa2-track-mouse (event)
   "Track mouse movement, handling hovering, panning, and node dragging.
+
 When a drag operation is active, calculate the difference between the current
 and starting mouse coordinates. Scale this delta by the current zoom level to
 keep the movement speed matching the visual scale. For viewport panning,
@@ -301,59 +305,39 @@ Nil."
                       (setq graph-fa2--pan-y (+ start-pan-y (* pixel-dy viewbox-scale)))
                       (graph-fa2--update-display)))
                    ((eq type 'node-move)
-                    (let* ((last-x (cdr (assoc 'last-mouse-x graph-fa2--drag-context)))
-                           (last-y (cdr (assoc 'last-mouse-y graph-fa2--drag-context)))
-                           (pixel-inc-dx (- curr-x last-x))
-                           (pixel-inc-dy (- curr-y last-y))
-                           (canvas-inc-dx (* pixel-inc-dx viewbox-scale))
-                           (canvas-inc-dy (* pixel-inc-dy viewbox-scale))
-                           (node-id (cdr (assoc 'node-id graph-fa2--drag-context)))
-                           (hitbox nil)
-                           (len (length graph-fa2--active-hitboxes)))
-                      (dotimes (i len)
-                        (let ((hb (aref graph-fa2--active-hitboxes i)))
-                          (when (equal (aref hb 0) node-id)
-                            (setq hitbox hb))))
-                      (when hitbox
-                        (let* ((orig-cx (aref hitbox 1))
-                               (orig-cy (aref hitbox 2))
-                               (new-cx (+ orig-cx canvas-inc-dx))
-                               (new-cy (+ orig-cy canvas-inc-dy)))
-                          (setq graph-fa2-current-svg
-                                (graph-fa2--update-node-svg-string
-                                 graph-fa2-current-svg
-                                 node-id
-                                 new-cx
-                                 new-cy
-                                 canvas-inc-dy))
-                          (setq graph-fa2--hitbox-svg-string graph-fa2-current-svg)
-                          (dotimes (i len)
-                            (let ((hb (aref graph-fa2--active-hitboxes i)))
-                              (when (equal (aref hb 0) node-id)
-                                (aset hb 1 new-cx)
-                                (aset hb 2 new-cy))))
-                          (setcdr (assoc 'last-mouse-x graph-fa2--drag-context) curr-x)
-                          (setcdr (assoc 'last-mouse-y graph-fa2--drag-context) curr-y)
-                          (graph-fa2--update-display)))))))))
-          (let* ((coords (posn-object-x-y posn))
-                 (size (posn-object-width-height posn))
-                 (node (when (and coords size)
-                         (graph-fa2-node-at-scaled-pos
-                          (float (car coords))
-                          (float (cdr coords))
-                          (max 1.0 (float (car size)))
-                          (max 1.0 (float (cdr size)))))))
-            (unless (equal node graph-fa2-hovered-node)
-              (setq graph-fa2-hovered-node node)
-              (let* ((inhibit-read-only t)
-                     (overlays (overlays-in (point-min) (point-max)))
-                     (ov (seq-find (lambda (o) (eq (overlay-get o 'window) window)) overlays)))
-                (if ov
-                    (overlay-put ov 'pointer (if node 'hand nil))
-                  (if node
-                      (put-text-property (point-min) (point-max) 'pointer 'hand)
-                    (put-text-property (point-min) (point-max) 'pointer nil))))
-              (run-hook-with-args 'graph-fa2-node-hovered-functions node))))))))
+                    (let* ((orig-x (cdr (assoc 'orig-x graph-fa2--drag-context)))
+                           (orig-y (cdr (assoc 'orig-y graph-fa2--drag-context)))
+                           (canvas-dx (* pixel-dx viewbox-scale))
+                           (canvas-dy (* pixel-dy viewbox-scale)))
+                      (setcdr (assoc 'ghost-x graph-fa2--drag-context) (+ orig-x canvas-dx))
+                      (setcdr (assoc 'ghost-y graph-fa2--drag-context) (+ orig-y canvas-dy))
+                      (setcdr (assoc 'last-mouse-x graph-fa2--drag-context) curr-x)
+                      (setcdr (assoc 'last-mouse-y graph-fa2--drag-context) curr-y)
+                      (setq graph-fa2--render-state nil)
+                      (graph-fa2--update-display)))))))
+          (let* ((base-buf (or (buffer-base-buffer) (current-buffer)))
+                 (is-playing (or graph-fa2--player-timer
+                                 (buffer-local-value 'graph-fa2--player-timer base-buf))))
+            (unless is-playing
+              (let* ((coords (posn-object-x-y posn))
+                     (size (posn-object-width-height posn))
+                     (node (when (and coords size)
+                             (graph-fa2-node-at-scaled-pos
+                              (float (car coords))
+                              (float (cdr coords))
+                              (max 1.0 (float (car size)))
+                              (max 1.0 (float (cdr size)))))))
+                (unless (equal node graph-fa2-hovered-node)
+                  (setq graph-fa2-hovered-node node)
+                  (let* ((inhibit-read-only t)
+                         (overlays (overlays-in (point-min) (point-max)))
+                         (ov (seq-find (lambda (o) (eq (overlay-get o 'window) window)) overlays)))
+                    (if ov
+                        (overlay-put ov 'pointer (if node 'hand nil))
+                      (if node
+                          (put-text-property (point-min) (point-max) 'pointer 'hand)
+                        (put-text-property (point-min) (point-max) 'pointer nil))))
+                  (run-hook-with-args 'graph-fa2-node-hovered-functions node))))))))))
 
 (defalias 'graph-fa2--track-mouse #'graph-fa2-track-mouse "Obsolete internal mouse tracking function alias.")
 (make-obsolete 'graph-fa2--track-mouse 'graph-fa2-track-mouse "1.0.0")
@@ -378,30 +362,44 @@ Nil."
         (select-window window)
       (when (window-live-p window)
         (with-current-buffer (window-buffer window)
-          (when-let* ((coords (posn-object-x-y posn))
-                      (size (posn-object-width-height posn))
-                      (mouse-x (float (car coords)))
-                      (mouse-y (float (cdr coords)))
-                      (img-w (max 1.0 (float (car size))))
-                      (img-h (max 1.0 (float (cdr size)))))
-            (if-let* ((node (graph-fa2-node-at-scaled-pos mouse-x mouse-y img-w img-h)))
-                (setq graph-fa2--drag-context
-                      (list (cons 'type 'node-move)
-                            (cons 'start-mouse-x mouse-x)
-                            (cons 'start-mouse-y mouse-y)
-                            (cons 'last-mouse-x mouse-x)
-                            (cons 'last-mouse-y mouse-y)
-                            (cons 'img-width img-w)
-                            (cons 'img-height img-h)
-                            (cons 'node-id node)))
-              (setq graph-fa2--drag-context
-                    (list (cons 'type 'pan)
-                          (cons 'start-mouse-x mouse-x)
-                          (cons 'start-mouse-y mouse-y)
-                          (cons 'img-width img-w)
-                          (cons 'img-height img-h)
-                          (cons 'start-pan-x graph-fa2--pan-x)
-                          (cons 'start-pan-y graph-fa2--pan-y))))))))))
+          (let* ((base-buf (or (buffer-base-buffer) (current-buffer)))
+                 (is-playing (or graph-fa2--player-timer
+                                 (buffer-local-value 'graph-fa2--player-timer base-buf))))
+            (when-let* ((coords (posn-object-x-y posn))
+                        (size (posn-object-width-height posn))
+                        (mouse-x (float (car coords)))
+                        (mouse-y (float (cdr coords)))
+                        (img-w (max 1.0 (float (car size))))
+                        (img-h (max 1.0 (float (cdr size)))))
+              (if is-playing
+                  (when-let* ((node (graph-fa2-node-at-scaled-pos mouse-x mouse-y img-w img-h)))
+                    (setq graph-fa2--drag-context
+                          (list (cons 'type 'click-only)
+                                (cons 'node-id node))))
+                (if-let* ((node (graph-fa2-node-at-scaled-pos mouse-x mouse-y img-w img-h))
+                          (hitbox (seq-find (lambda (hb) (equal (aref hb 0) node)) graph-fa2--active-hitboxes)))
+                    (setq graph-fa2--drag-context
+                          (list (cons 'type 'node-move)
+                                (cons 'start-mouse-x mouse-x)
+                                (cons 'start-mouse-y mouse-y)
+                                (cons 'last-mouse-x mouse-x)
+                                (cons 'last-mouse-y mouse-y)
+                                (cons 'img-width img-w)
+                                (cons 'img-height img-h)
+                                (cons 'node-id node)
+                                (cons 'ghost-x (aref hitbox 1))
+                                (cons 'ghost-y (aref hitbox 2))
+                                (cons 'orig-x (aref hitbox 1))
+                                (cons 'orig-y (aref hitbox 2))
+                                (cons 'radius (aref hitbox 3))))
+                  (setq graph-fa2--drag-context
+                        (list (cons 'type 'pan)
+                              (cons 'start-mouse-x mouse-x)
+                              (cons 'start-mouse-y mouse-y)
+                              (cons 'img-width img-w)
+                              (cons 'img-height img-h)
+                              (cons 'start-pan-x graph-fa2--pan-x)
+                              (cons 'start-pan-y graph-fa2--pan-y))))))))))))
 
 (defun graph-fa2--discover-context (base-buf)
   "Locate and return the active physics simulation context.
@@ -512,23 +510,33 @@ Nil."
               (_ (eq window (selected-window)))
               (drag-ctx graph-fa2--drag-context))
     (setq graph-fa2--drag-context nil)
-    (when-let* ((type (cdr (assoc 'type drag-ctx)))
-                ((eq type 'node-move))
-                (node-id (cdr (assoc 'node-id drag-ctx)))
-                (start-x (cdr (assoc 'start-mouse-x drag-ctx)))
-                (start-y (cdr (assoc 'start-mouse-y drag-ctx)))
-                (last-x (cdr (assoc 'last-mouse-x drag-ctx)))
-                (last-y (cdr (assoc 'last-mouse-y drag-ctx)))
-                (dx (- last-x start-x))
-                (dy (- last-y start-y)))
-      (if (< (+ (* dx dx) (* dy dy)) 4.0)
-          (run-hook-with-args 'graph-fa2-node-clicked-functions node-id)
-        (when-let* ((base-buf (or (buffer-base-buffer) (current-buffer)))
-                    (pb (buffer-local-value 'graph-fa2-playback-buffer base-buf))
-                    (ctx (graph-fa2--discover-context base-buf))
-                    ((buffer-live-p pb)))
-          (graph-fa2--sync-physics ctx graph-fa2--active-hitboxes)
-          (graph-fa2--init-background-worker ctx pb base-buf)))))
+    (graph-fa2--update-display)
+    (when-let* ((type (cdr (assoc 'type drag-ctx))))
+      (cond
+       ((eq type 'click-only)
+        (run-hook-with-args 'graph-fa2-node-clicked-functions (cdr (assoc 'node-id drag-ctx))))
+       
+       ((eq type 'node-move)
+        (when-let* ((node-id (cdr (assoc 'node-id drag-ctx)))
+                    (start-x (cdr (assoc 'start-mouse-x drag-ctx)))
+                    (start-y (cdr (assoc 'start-mouse-y drag-ctx)))
+                    (last-x (cdr (assoc 'last-mouse-x drag-ctx)))
+                    (last-y (cdr (assoc 'last-mouse-y drag-ctx)))
+                    (dx (- last-x start-x))
+                    (dy (- last-y start-y)))
+          (if (< (+ (* dx dx) (* dy dy)) 4.0)
+              (run-hook-with-args 'graph-fa2-node-clicked-functions node-id)
+            (when-let* ((base-buf (or (buffer-base-buffer) (current-buffer)))
+                        (pb (buffer-local-value 'graph-fa2-playback-buffer base-buf))
+                        (ctx (graph-fa2--discover-context base-buf))
+                        (_ (buffer-live-p pb))
+                        (ghost-x (cdr (assoc 'ghost-x drag-ctx)))
+                        (ghost-y (cdr (assoc 'ghost-y drag-ctx)))
+                        (hitbox (seq-find (lambda (hb) (equal (aref hb 0) node-id)) graph-fa2--active-hitboxes)))
+              (aset hitbox 1 ghost-x)
+              (aset hitbox 2 ghost-y)
+              (graph-fa2--sync-physics ctx graph-fa2--active-hitboxes)
+              (graph-fa2--init-background-worker ctx pb base-buf))))))))
   (when graph-fa2--drag-context
     (setq graph-fa2--drag-context nil)))
 
@@ -1104,7 +1112,7 @@ be added directly during rendering."
         (substring svg-string start))))
    (t svg-string)))
 
-(defun graph-fa2--update-display (&rest args)
+(defun graph-fa2--update-display (&rest _)
   "Render the current SVG frame into the buffer natively using window-specific overlays.
 This function checks for an existing overlay associated with the current window.
 If one does not exist, it creates the overlay and restricts its visibility
@@ -1116,31 +1124,41 @@ ARGS: Optional list of arguments (ignored).
 Returns:
 Nil."
   (when (and graph-fa2-current-svg (get-buffer-window (current-buffer) t))
-    (let* ((inhibit-read-only t)
-           (win (get-buffer-window (current-buffer) t))
+    (let* ((win (get-buffer-window (current-buffer) t))
            (width (max 100 (window-pixel-width win)))
            (height (max 100 (window-pixel-height win)))
-           (inner-elements (graph-fa2--grab-inner-elements graph-fa2-current-svg))
-           (viewbox-dim (/ graph-fa2--canvas-size graph-fa2--scale))
-           (viewbox-x (- (- (/ graph-fa2--canvas-size 2.0) graph-fa2--pan-x) (/ viewbox-dim 2.0)))
-           (viewbox-y (- (- (/ graph-fa2--canvas-size 2.0) graph-fa2--pan-y) (/ viewbox-dim 2.0)))
-           (full-svg (format "<svg width=\"%d\" height=\"%d\" viewBox=\"%.2f %.2f %.2f %.2f\" xmlns=\"http://www.w3.org/2000/svg\" preserveAspectRatio=\"xMidYMid meet\">\n%s\n</svg>"
-                             width height viewbox-x viewbox-y viewbox-dim viewbox-dim inner-elements))
-           (encoded-svg (if (multibyte-string-p full-svg)
-                            (encode-coding-string full-svg 'utf-8)
-                          full-svg)))
-      (clear-image-cache)
-      (when (= (buffer-size) 0) (insert " "))
-      (remove-text-properties (point-min) (point-max) '(display nil pointer nil))
-      (let* ((overlays (overlays-in (point-min) (point-max)))
-             (ov (seq-find (lambda (o) (eq (overlay-get o 'window) win)) overlays)))
-        (unless ov
-          (setq ov (make-overlay (point-min) (point-max)))
-          (overlay-put ov 'window win))
-        (move-overlay ov (point-min) (point-max))
-        (overlay-put ov 'display (create-image encoded-svg 'svg t))
-        (overlay-put ov 'pointer (if graph-fa2-hovered-node 'hand nil)))
-      (run-hooks 'graph-fa2-after-render-functions))))
+           (is-ghost (and graph-fa2--drag-context (eq (cdr (assoc 'type graph-fa2--drag-context)) 'node-move)))
+           (ghost-x (when is-ghost (cdr (assoc 'ghost-x graph-fa2--drag-context))))
+           (ghost-y (when is-ghost (cdr (assoc 'ghost-y graph-fa2--drag-context))))
+           (ghost-r (when is-ghost (cdr (assoc 'radius graph-fa2--drag-context))))
+           (state (list graph-fa2-current-svg graph-fa2--pan-x graph-fa2--pan-y graph-fa2--scale width height graph-fa2-hovered-node ghost-x ghost-y)))
+      (unless (equal state graph-fa2--render-state)
+        (setq graph-fa2--render-state state)
+        (let* ((inhibit-read-only t)
+               (inner-elements (graph-fa2--grab-inner-elements graph-fa2-current-svg))
+               (inner-elements (if is-ghost
+                                   (concat inner-elements (format "\n  <circle cx=\"%.2f\" cy=\"%.2f\" r=\"%.2f\" fill=\"none\" stroke=\"#a6adc8\" stroke-width=\"2\" stroke-dasharray=\"4\" />" ghost-x ghost-y ghost-r))
+                                 inner-elements))
+               (viewbox-dim (/ graph-fa2--canvas-size graph-fa2--scale))
+               (viewbox-x (- (- (/ graph-fa2--canvas-size 2.0) graph-fa2--pan-x) (/ viewbox-dim 2.0)))
+               (viewbox-y (- (- (/ graph-fa2--canvas-size 2.0) graph-fa2--pan-y) (/ viewbox-dim 2.0)))
+               (full-svg (format "<svg width=\"%d\" height=\"%d\" viewBox=\"%.2f %.2f %.2f %.2f\" xmlns=\"http://www.w3.org/2000/svg\" preserveAspectRatio=\"xMidYMid meet\">\n%s\n</svg>"
+                                 width height viewbox-x viewbox-y viewbox-dim viewbox-dim inner-elements))
+               (encoded-svg (if (multibyte-string-p full-svg)
+                                (encode-coding-string full-svg 'utf-8)
+                              full-svg)))
+          (clear-image-cache)
+          (when (= (buffer-size) 0) (insert " "))
+          (remove-text-properties (point-min) (point-max) '(display nil pointer nil))
+          (let* ((overlays (overlays-in (point-min) (point-max)))
+                 (ov (seq-find (lambda (o) (eq (overlay-get o 'window) win)) overlays)))
+            (unless ov
+              (setq ov (make-overlay (point-min) (point-max)))
+              (overlay-put ov 'window win))
+            (move-overlay ov (point-min) (point-max))
+            (overlay-put ov 'display (create-image encoded-svg 'svg t))
+            (overlay-put ov 'pointer (if graph-fa2-hovered-node 'hand nil)))
+          (run-hooks 'graph-fa2-after-render-functions))))))
 
 (defun graph-fa2--player-tick ()
   "Advance the animation frame natively from memory buffers.
