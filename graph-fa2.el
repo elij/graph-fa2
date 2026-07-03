@@ -1,7 +1,7 @@
 ;;; graph-fa2.el --- ForceAtlas2 pure-elisp background-cached engine -*- lexical-binding: t -*-
 
 ;; Author: Elijah Charles
-;; Version: 0.0.2
+;; Version: 0.0.3
 
 (eval-when-compile
   (when (boundp 'comp-speed)
@@ -9,6 +9,8 @@
 
 (require 'cl-lib)
 (require 'json)
+(require 'subr-x)
+(require 'seq)
 
 (defgroup graph-fa2 nil
   "ForceAtlas2 graph layout engine."
@@ -131,105 +133,17 @@ Each function must accept one argument: the node identifier, or nil if cleared."
 (defvar-local graph-fa2-hovered-node nil
   "Tracks the currently hovered node within the fa2 engine.")
 
+(defvar-local graph-fa2--pan-x 0.0
+  "Horizontal pan offset of the graph viewport.")
+
+(defvar-local graph-fa2--pan-y 0.0
+  "Vertical pan offset of the graph viewport.")
+
+(defvar-local graph-fa2--drag-context nil
+  "The current drag context of the graph viewport.")
+
 (defvar graph-fa2-after-render-functions nil
   "Hook run after a graph frame is rendered.")
-
-(defun graph-fa2-track-mouse (event)
-  "Track mouse movement internally, swap cursor, and fire hover hooks."
-  (interactive "e")
-  (let* ((posn (event-start event))
-         (window (posn-window posn)))
-    (when (window-live-p window)
-      (with-current-buffer (window-buffer window)
-        (let* ((coords (posn-object-x-y posn))
-               (size (posn-object-width-height posn))
-               (node (when (and coords size)
-                       (graph-fa2-node-at-scaled-pos
-                        (float (car coords))
-                        (float (cdr coords))
-                        (max 1.0 (float (car size)))
-                        (max 1.0 (float (cdr size)))))))
-          
-          (unless (equal node graph-fa2-hovered-node)
-            (setq graph-fa2-hovered-node node)
-            (let ((inhibit-read-only t))
-              (if node
-                  (put-text-property (point-min) (point-max) 'pointer 'hand)
-                (put-text-property (point-min) (point-max) 'pointer nil)))
-            (run-hook-with-args 'graph-fa2-node-hovered-functions node)))))))
-
-(defalias 'graph-fa2--track-mouse #'graph-fa2-track-mouse "Obsolete internal mouse tracking function alias.")
-(make-obsolete 'graph-fa2--track-mouse 'graph-fa2-track-mouse "1.0.0")
-
-(defun graph-fa2-click-node (event)
-  "Handle a mouse click event on a graph node.
-Extract the node coordinates from EVENT and parse the active node
-from the SVG string to pass the resolved node to subscribers."
-  (interactive "e")
-  (let* ((posn (event-start event))
-         (window (posn-window posn)))
-    (when (window-live-p window)
-      (with-current-buffer (window-buffer window)
-        (let* ((coords (posn-object-x-y posn))
-               (size (posn-object-width-height posn))
-               (node (when (and coords size)
-                       (graph-fa2-node-at-scaled-pos
-                        (float (car coords))
-                        (float (cdr coords))
-                        (max 1.0 (float (car size)))
-                        (max 1.0 (float (cdr size)))))))
-          (when node
-            (run-hook-with-args 'graph-fa2-node-clicked-functions node)))))))
-
-(defun graph-fa2-node-at-scaled-pos (active-x active-y img-w img-h)
-  "Extract the closest node identifier at the given coordinates."
-
-  (when (and graph-fa2-current-svg
-             (not (equal graph-fa2-current-svg graph-fa2--hitbox-svg-string)))
-    (let ((hitboxes nil)
-          (start 0))
-      (while (string-match "<circle cx=\"\\([0-9.]+\\)\" cy=\"\\([0-9.]+\\)\" r=\"\\([0-9.]+\\)\"[^>]*data-name=\"\\([^\"]+\\)\"" graph-fa2-current-svg start)
-        (let ((cx (string-to-number (match-string 1 graph-fa2-current-svg)))
-              (cy (string-to-number (match-string 2 graph-fa2-current-svg)))
-              (r (string-to-number (match-string 3 graph-fa2-current-svg)))
-              (id (graph-fa2--unescape-xml (match-string 4 graph-fa2-current-svg))))
-          (push (vector id cx cy r) hitboxes))
-        (setq start (match-end 0)))
-      (setq graph-fa2--active-hitboxes (vconcat (nreverse hitboxes)))
-      (setq graph-fa2--hitbox-svg-string graph-fa2-current-svg)))
-
-  (let* ((min-dim (min img-w img-h))
-         (pad-x (/ (- img-w min-dim) 2.0))
-         (pad-y (/ (- img-h min-dim) 2.0))
-         (adj-x (- active-x pad-x))
-         (adj-y (- active-y pad-y)))
-
-    (when (and (>= adj-x 0) (<= adj-x min-dim)
-               (>= adj-y 0) (<= adj-y min-dim))
-      (let* ((viewbox-dim (/ graph-fa2--canvas-size graph-fa2--scale))
-             (viewbox-x (- (/ graph-fa2--canvas-size 2.0) (/ viewbox-dim 2.0)))
-             (viewbox-y (- (/ graph-fa2--canvas-size 2.0) (/ viewbox-dim 2.0)))
-             (viewbox-scale (/ viewbox-dim min-dim))
-             (mouse-x (+ viewbox-x (* adj-x viewbox-scale)))
-             (mouse-y (+ viewbox-y (* adj-y viewbox-scale)))
-             (nodes graph-fa2--active-hitboxes)
-             (len (if nodes (length nodes) 0))
-             (closest-node nil)
-             (min-dist-sq 900.0))
-
-        (dotimes (i len)
-          (let* ((n (aref nodes i))
-                 (nx (aref n 1))
-                 (ny (aref n 2))
-                 (dx (- mouse-x nx))
-                 (dy (- mouse-y ny))
-                 (dist-sq (+ (* dx dx) (* dy dy))))
-
-            (when (< dist-sq min-dist-sq)
-              (setq min-dist-sq dist-sq)
-              (setq closest-node (aref n 0)))))
-
-        closest-node))))
 
 (cl-defstruct graph-fa2-ctx
   "State structure for ForceAtlas2 physics simulation.
@@ -307,6 +221,372 @@ garbage collection pressure, and running animation state."
 (defsubst fa2-set-dy (n v)
   "Set the y velocity of node N to V."
   (aset n 5 v))
+
+(defun graph-fa2--cancel-drag (&rest _)
+  "Clear the drag context, typically used when window focus changes."
+  (when graph-fa2--drag-context
+    (setq graph-fa2--drag-context nil)))
+
+(defun graph-fa2--update-node-svg-string (svg-string node-id new-cx new-cy dy)
+  "Update the SVG XML string to move a node and its text.
+
+Parameters:
+SVG-STRING: The complete SVG XML string of the graph frame.
+NODE-ID: The identifier of the node to move.
+NEW-CX: The new horizontal coordinate for the node.
+NEW-CY: The new vertical coordinate for the node.
+DY: The incremental vertical delta to apply to the text tspans.
+
+Returns:
+The updated SVG XML string."
+  (if-let* ((esc-id (graph-fa2--escape-xml node-id))
+            (circle-re (concat "<circle cx=\"\\([0-9.-]+\\)\" cy=\"\\([0-9.-]+\\)\"[^>]*data-name=\"" (regexp-quote esc-id) "\""))
+            (start-pos (and svg-string (string-match circle-re svg-string)))
+            (circle-end (match-end 0))
+            (text-end (when (string-match "</text>" svg-string circle-end) (match-end 0))))
+      (let* ((node-block (substring svg-string start-pos text-end))
+             (circle-repl (format "<circle cx=\"%.2f\" cy=\"%.2f\"" new-cx new-cy))
+             (updated-block (replace-regexp-in-string "<circle cx=\"[0-9.-]+\" cy=\"[0-9.-]+\"" circle-repl node-block t t))
+             (updated-block (replace-regexp-in-string "x=\"[0-9.-]+\"" (format "x=\"%.2f\"" new-cx) updated-block t t))
+             (pos 0))
+        (while (string-match "y=\"\\([0-9.-]+\\)\"" updated-block pos)
+          (let* ((old-y (string-to-number (match-string 1 updated-block)))
+                 (new-y (+ old-y dy))
+                 (replacement (format "y=\"%.2f\"" new-y)))
+            (setq updated-block (replace-match replacement t t updated-block))
+            (setq pos (+ (match-beginning 0) (length replacement)))))
+        (concat (substring svg-string 0 start-pos)
+                updated-block
+                (substring svg-string text-end)))
+    svg-string))
+
+(defun graph-fa2-track-mouse (event)
+  "Track mouse movement, handling hovering, panning, and node dragging.
+When a drag operation is active, calculate the difference between the current
+and starting mouse coordinates. Scale this delta by the current zoom level to
+keep the movement speed matching the visual scale. For viewport panning,
+adjust the horizontal and vertical offset variables. For node movement, update the
+SVG coordinates, update the active hitboxes, and trigger a display refresh.
+When no drag is active, update the hovered node state and change the cursor.
+
+Parameters:
+EVENT: The mouse movement event.
+
+Returns:
+Nil."
+  (interactive "e")
+  (let* ((posn (event-start event))
+         (window (posn-window posn)))
+    (when (window-live-p window)
+      (with-current-buffer (window-buffer window)
+        (if graph-fa2--drag-context
+            (let* ((coords (posn-object-x-y posn))
+                   (type (cdr (assoc 'type graph-fa2--drag-context)))
+                   (start-x (cdr (assoc 'start-mouse-x graph-fa2--drag-context)))
+                   (start-y (cdr (assoc 'start-mouse-y graph-fa2--drag-context)))
+                   (img-w (cdr (assoc 'img-width graph-fa2--drag-context)))
+                   (img-h (cdr (assoc 'img-height graph-fa2--drag-context))))
+              (when (and coords img-w img-h)
+                (let* ((curr-x (float (car coords)))
+                       (curr-y (float (cdr coords)))
+                       (pixel-dx (- curr-x start-x))
+                       (pixel-dy (- curr-y start-y))
+                       (min-dim (min img-w img-h))
+                       (viewbox-scale (/ graph-fa2--canvas-size (* graph-fa2--scale min-dim))))
+                  (cond
+                   ((eq type 'pan)
+                    (let ((start-pan-x (cdr (assoc 'start-pan-x graph-fa2--drag-context)))
+                          (start-pan-y (cdr (assoc 'start-pan-y graph-fa2--drag-context))))
+                      (setq graph-fa2--pan-x (+ start-pan-x (* pixel-dx viewbox-scale)))
+                      (setq graph-fa2--pan-y (+ start-pan-y (* pixel-dy viewbox-scale)))
+                      (graph-fa2--update-display)))
+                   ((eq type 'node-move)
+                    (let* ((last-x (cdr (assoc 'last-mouse-x graph-fa2--drag-context)))
+                           (last-y (cdr (assoc 'last-mouse-y graph-fa2--drag-context)))
+                           (pixel-inc-dx (- curr-x last-x))
+                           (pixel-inc-dy (- curr-y last-y))
+                           (canvas-inc-dx (* pixel-inc-dx viewbox-scale))
+                           (canvas-inc-dy (* pixel-inc-dy viewbox-scale))
+                           (node-id (cdr (assoc 'node-id graph-fa2--drag-context)))
+                           (hitbox nil)
+                           (len (length graph-fa2--active-hitboxes)))
+                      (dotimes (i len)
+                        (let ((hb (aref graph-fa2--active-hitboxes i)))
+                          (when (equal (aref hb 0) node-id)
+                            (setq hitbox hb))))
+                      (when hitbox
+                        (let* ((orig-cx (aref hitbox 1))
+                               (orig-cy (aref hitbox 2))
+                               (new-cx (+ orig-cx canvas-inc-dx))
+                               (new-cy (+ orig-cy canvas-inc-dy)))
+                          (setq graph-fa2-current-svg
+                                (graph-fa2--update-node-svg-string
+                                 graph-fa2-current-svg
+                                 node-id
+                                 new-cx
+                                 new-cy
+                                 canvas-inc-dy))
+                          (setq graph-fa2--hitbox-svg-string graph-fa2-current-svg)
+                          (dotimes (i len)
+                            (let ((hb (aref graph-fa2--active-hitboxes i)))
+                              (when (equal (aref hb 0) node-id)
+                                (aset hb 1 new-cx)
+                                (aset hb 2 new-cy))))
+                          (setcdr (assoc 'last-mouse-x graph-fa2--drag-context) curr-x)
+                          (setcdr (assoc 'last-mouse-y graph-fa2--drag-context) curr-y)
+                          (graph-fa2--update-display)))))))))
+          (let* ((coords (posn-object-x-y posn))
+                 (size (posn-object-width-height posn))
+                 (node (when (and coords size)
+                         (graph-fa2-node-at-scaled-pos
+                          (float (car coords))
+                          (float (cdr coords))
+                          (max 1.0 (float (car size)))
+                          (max 1.0 (float (cdr size)))))))
+            (unless (equal node graph-fa2-hovered-node)
+              (setq graph-fa2-hovered-node node)
+              (let* ((inhibit-read-only t)
+                     (overlays (overlays-in (point-min) (point-max)))
+                     (ov (seq-find (lambda (o) (eq (overlay-get o 'window) window)) overlays)))
+                (if ov
+                    (overlay-put ov 'pointer (if node 'hand nil))
+                  (if node
+                      (put-text-property (point-min) (point-max) 'pointer 'hand)
+                    (put-text-property (point-min) (point-max) 'pointer nil))))
+              (run-hook-with-args 'graph-fa2-node-hovered-functions node))))))))
+
+(defalias 'graph-fa2--track-mouse #'graph-fa2-track-mouse "Obsolete internal mouse tracking function alias.")
+(make-obsolete 'graph-fa2--track-mouse 'graph-fa2-track-mouse "1.0.0")
+
+(defun graph-fa2-mouse-down (event)
+  "Handle mouse button press to start panning the viewport or moving a node.
+This function extracts the clicked coordinates and checks if a node is
+located under the cursor. If a node is found, initialise a node-move drag
+context storing its ID and starting mouse coordinates. If no node is found,
+initialise a panning drag context storing the starting pan offsets and mouse
+coordinates.
+
+Parameters:
+EVENT: The mouse press event.
+
+Returns:
+Nil."
+  (interactive "e")
+  (when-let* ((posn (event-start event))
+              (window (posn-window posn)))
+    (if (not (eq window (selected-window)))
+        (select-window window)
+      (when (window-live-p window)
+        (with-current-buffer (window-buffer window)
+          (when-let* ((coords (posn-object-x-y posn))
+                      (size (posn-object-width-height posn))
+                      (mouse-x (float (car coords)))
+                      (mouse-y (float (cdr coords)))
+                      (img-w (max 1.0 (float (car size))))
+                      (img-h (max 1.0 (float (cdr size)))))
+            (if-let* ((node (graph-fa2-node-at-scaled-pos mouse-x mouse-y img-w img-h)))
+                (setq graph-fa2--drag-context
+                      (list (cons 'type 'node-move)
+                            (cons 'start-mouse-x mouse-x)
+                            (cons 'start-mouse-y mouse-y)
+                            (cons 'last-mouse-x mouse-x)
+                            (cons 'last-mouse-y mouse-y)
+                            (cons 'img-width img-w)
+                            (cons 'img-height img-h)
+                            (cons 'node-id node)))
+              (setq graph-fa2--drag-context
+                    (list (cons 'type 'pan)
+                          (cons 'start-mouse-x mouse-x)
+                          (cons 'start-mouse-y mouse-y)
+                          (cons 'img-width img-w)
+                          (cons 'img-height img-h)
+                          (cons 'start-pan-x graph-fa2--pan-x)
+                          (cons 'start-pan-y graph-fa2--pan-y))))))))))
+
+(defun graph-fa2--discover-context (base-buf)
+  "Locate and return the active physics simulation context.
+
+Iterates through local variables of BASE-BUF and its associated
+playback buffer to find the physics context struct.
+
+Parameters:
+BASE-BUF: The base buffer containing local variables.
+
+Returns:
+The ForceAtlas2 context structure if found, nil otherwise."
+  (let* ((pb (buffer-local-value 'graph-fa2-playback-buffer base-buf))
+         (ctx nil))
+    (dolist (var (buffer-local-variables base-buf))
+      (when (and (consp var) (graph-fa2-ctx-p (cdr var)))
+        (setq ctx (cdr var))))
+    (when (and (not ctx) (buffer-live-p pb))
+      (dolist (var (buffer-local-variables pb))
+        (when (and (consp var) (graph-fa2-ctx-p (cdr var)))
+          (setq ctx (cdr var)))))
+    ctx))
+
+(defun graph-fa2--sync-physics (ctx hitboxes)
+  "Synchronise physics arrays with visual hitboxes.
+
+Halts all ongoing momentum and maps the current visual coordinates
+from the SVG canvas back to the physics simulation state.
+
+Parameters:
+CTX: The ForceAtlas2 physics context structure.
+HITBOXES: Vector of active node hitboxes on the visual canvas.
+
+Returns:
+Nil."
+  (let* ((nodes (graph-fa2-ctx-nodes ctx))
+         (len (length nodes))
+         (pos-x (graph-fa2-ctx-pos-x ctx))
+         (pos-y (graph-fa2-ctx-pos-y ctx))
+         (vel-x (graph-fa2-ctx-vel-x ctx))
+         (vel-y (graph-fa2-ctx-vel-y ctx))
+         (hitbox-map (make-hash-table :test 'equal)))
+    (fillarray vel-x 0)
+    (fillarray vel-y 0)
+    (seq-doseq (hb hitboxes)
+      (puthash (aref hb 0) hb hitbox-map))
+    (dotimes (i len)
+      (let* ((n (aref nodes i))
+             (n-id (fa2-id n))
+             (hitbox (gethash n-id hitbox-map)))
+        (when hitbox
+          (aset pos-x i (truncate (* 256.0 (- (aref hitbox 1) 250.0))))
+          (aset pos-y i (truncate (* 256.0 (- (aref hitbox 2) 250.0)))))))))
+
+(defun graph-fa2--init-background-worker (ctx pb base-buf)
+  "Initialise a purely in-memory background worker for physics calculation.
+
+Erases relevant buffers, resets tracking variables, ticks the physics
+synchronously for one immediate frame, triggers a hot reload, and
+schedules the continuous cooperative rendering chunk timer.
+
+Parameters:
+CTX: The ForceAtlas2 physics context structure.
+PB: The playback buffer for the current simulation.
+BASE-BUF: The target base buffer for the hot reload.
+
+Returns:
+Nil."
+  (unless (buffer-live-p (graph-fa2-ctx-bg-buffer ctx))
+    (setf (graph-fa2-ctx-bg-buffer ctx) (generate-new-buffer " *graph-fa2-bg*")))
+  (with-current-buffer (graph-fa2-ctx-bg-buffer ctx)
+    (erase-buffer))
+  (when (buffer-live-p pb)
+    (with-current-buffer pb
+      (erase-buffer)))
+  (with-current-buffer base-buf
+    (setq graph-fa2--current-frame 0)
+    (setq graph-fa2--frame-offsets nil))
+  (setf (graph-fa2-ctx-playback-started ctx) t)
+  (when (graph-fa2-ctx-bg-timer ctx)
+    (cancel-timer (graph-fa2-ctx-bg-timer ctx)))
+  
+  (setf (graph-fa2-ctx-bg-frame ctx) 100)
+  (graph-fa2--physics-tick ctx 100)
+  (setf (graph-fa2-ctx-frames-rendered ctx) 101)
+  
+  (graph-fa2--hot-reload-player base-buf (graph-fa2-ctx-bg-buffer ctx))
+  (setf (graph-fa2-ctx-bg-timer ctx)
+        (run-at-time 0 nil #'graph-fa2--render-chunk 
+                     ctx nil nil nil 
+                     base-buf 250 graph-fa2-framerate)))
+
+(defun graph-fa2-mouse-up (event)
+  "Handle mouse release to end dragging or trigger a node click function.
+
+If the distance calculation confirms a click, execute registered hook functions.
+If it confirms a drag, discover the active physics context, synchronise
+the canvas coordinates with the simulation, and respawn the worker.
+
+Parameters:
+EVENT: The mouse release event.
+
+Returns:
+Nil."
+  (interactive "e")
+  (when-let* ((posn (event-start event))
+              (window (posn-window posn))
+              (_ (eq window (selected-window)))
+              (drag-ctx graph-fa2--drag-context))
+    (setq graph-fa2--drag-context nil)
+    (when-let* ((type (cdr (assoc 'type drag-ctx)))
+                ((eq type 'node-move))
+                (node-id (cdr (assoc 'node-id drag-ctx)))
+                (start-x (cdr (assoc 'start-mouse-x drag-ctx)))
+                (start-y (cdr (assoc 'start-mouse-y drag-ctx)))
+                (last-x (cdr (assoc 'last-mouse-x drag-ctx)))
+                (last-y (cdr (assoc 'last-mouse-y drag-ctx)))
+                (dx (- last-x start-x))
+                (dy (- last-y start-y)))
+      (if (< (+ (* dx dx) (* dy dy)) 4.0)
+          (run-hook-with-args 'graph-fa2-node-clicked-functions node-id)
+        (when-let* ((base-buf (or (buffer-base-buffer) (current-buffer)))
+                    (pb (buffer-local-value 'graph-fa2-playback-buffer base-buf))
+                    (ctx (graph-fa2--discover-context base-buf))
+                    ((buffer-live-p pb)))
+          (graph-fa2--sync-physics ctx graph-fa2--active-hitboxes)
+          (graph-fa2--init-background-worker ctx pb base-buf)))))
+  (when graph-fa2--drag-context
+    (setq graph-fa2--drag-context nil)))
+
+(defun graph-fa2-node-at-scaled-pos (active-x active-y img-w img-h)
+  "Extract the closest node identifier at the given coordinates.
+This function translates the screen pixel coordinates to SVG coordinates,
+accounting for zoom and panning, and searches the active hitboxes vector
+for the node closest to the cursor.
+
+Parameters:
+ACTIVE-X: The horizontal mouse coordinate relative to the image.
+ACTIVE-Y: The vertical mouse coordinate relative to the image.
+IMG-W: The width of the rendered image.
+IMG-H: The height of the rendered image.
+
+Returns:
+The identifier of the closest node, or nil if no node is near."
+  (when (and graph-fa2-current-svg
+             (not (equal graph-fa2-current-svg graph-fa2--hitbox-svg-string)))
+    (let ((hitboxes nil)
+          (start 0))
+      (while (string-match "<circle cx=\"\\([0-9.]+\\)\" cy=\"\\([0-9.]+\\)\" r=\"\\([0-9.]+\\)\"[^>]*data-name=\"\\([^\"]+\\)\"" graph-fa2-current-svg start)
+        (let ((cx (string-to-number (match-string 1 graph-fa2-current-svg)))
+              (cy (string-to-number (match-string 2 graph-fa2-current-svg)))
+              (r (string-to-number (match-string 3 graph-fa2-current-svg)))
+              (id (graph-fa2--unescape-xml (match-string 4 graph-fa2-current-svg))))
+          (push (vector id cx cy r) hitboxes))
+        (setq start (match-end 0)))
+      (setq graph-fa2--active-hitboxes (vconcat (nreverse hitboxes)))
+      (setq graph-fa2--hitbox-svg-string graph-fa2-current-svg)))
+  (let* ((min-dim (min img-w img-h))
+         (pad-x (/ (- img-w min-dim) 2.0))
+         (pad-y (/ (- img-h min-dim) 2.0))
+         (adj-x (- active-x pad-x))
+         (adj-y (- active-y pad-y)))
+    (when (and (>= adj-x 0) (<= adj-x min-dim)
+               (>= adj-y 0) (<= adj-y min-dim))
+      (let* ((viewbox-dim (/ graph-fa2--canvas-size graph-fa2--scale))
+             (viewbox-x (- (- (/ graph-fa2--canvas-size 2.0) graph-fa2--pan-x) (/ viewbox-dim 2.0)))
+             (viewbox-y (- (- (/ graph-fa2--canvas-size 2.0) graph-fa2--pan-y) (/ viewbox-dim 2.0)))
+             (viewbox-scale (/ viewbox-dim min-dim))
+             (mouse-x (+ viewbox-x (* adj-x viewbox-scale)))
+             (mouse-y (+ viewbox-y (* adj-y viewbox-scale)))
+             (nodes graph-fa2--active-hitboxes)
+             (len (if nodes (length nodes) 0))
+             (closest-node nil)
+             (min-dist-sq 900.0))
+        (dotimes (i len)
+          (let* ((n (aref nodes i))
+                 (nx (aref n 1))
+                 (ny (aref n 2))
+                 (dx (- mouse-x nx))
+                 (dy (- mouse-y ny))
+                 (dist-sq (+ (* dx dx) (* dy dy))))
+            (when (< dist-sq min-dist-sq)
+              (setq min-dist-sq dist-sq)
+              (setq closest-node (aref n 0)))))
+        closest-node))))
 
 (defun graph-fa2--escape-xml (str)
   "Escape XML characters in STR."
@@ -577,7 +857,6 @@ garbage collection pressure during background rendering."
          (edges (graph-fa2-ctx-edges ctx))
          (pos-x (graph-fa2-ctx-pos-x ctx))
          (pos-y (graph-fa2-ctx-pos-y ctx))
-         (hitboxes (make-vector len nil))
          (gc-cons-threshold most-positive-fixnum))
     (with-current-buffer (graph-fa2-ctx-bg-buffer ctx)
       (let* ((half-canvas (truncate (/ 500.0 2.0))))
@@ -604,8 +883,6 @@ garbage collection pressure during background rendering."
                  (lines (graph-fa2--wrap-text name-escaped 10))
                  (line-height 12)
                  (start-y (- ny-int 15 (* (1- (length lines)) (/ line-height 2)))))
-
-            (aset hitboxes i (vector id nx-int ny-int radius))
             (insert "  <circle cx=\"" nx "\" cy=\"" ny "\" r=\"" (number-to-string radius) "\" fill=\"" colour "\" data-name=\"" (graph-fa2--escape-xml id) "\" />\n")
             (insert "  <text fill=\"#cdd6f4\" font-size=\"10\" text-anchor=\"middle\">\n")
             (let ((curr-y start-y))
@@ -613,7 +890,6 @@ garbage collection pressure during background rendering."
                 (insert "    <tspan x=\"" nx "\" y=\"" (number-to-string curr-y) "\">" line "</tspan>\n")
                 (cl-incf curr-y line-height)))
             (insert "  </text>\n")))
-        (setq graph-fa2--active-hitboxes hitboxes)
         (insert "<FRAME_SPLIT>\n")))))
 
 (defun graph-fa2--physics-tick (ctx max-frames)
@@ -643,28 +919,56 @@ Synchronise buffers to state and trigger background rendering."
         (graph-fa2--render-svg ctx len)))))
 
 (defun graph-fa2--hot-reload-player (buf bg-buffer)
-  "Feeds newly rendered frames into the live player without restarting."
+  "Feed newly rendered frames into the live player without restarting.
+
+Parameters:
+BUF: The live target buffer viewing the layout.
+BG-BUFFER: The background buffer rendering the layout.
+
+Returns:
+Nil."
   (when (buffer-live-p buf)
     (let ((playback-buf (buffer-local-value 'graph-fa2-playback-buffer buf)))
       (when (buffer-live-p playback-buf)
-        (with-current-buffer playback-buf
-          (let ((inhibit-read-only t)
-                (offsets nil))
-            (erase-buffer)
-            (insert-buffer-substring bg-buffer)
-            (goto-char (point-min))
-            (let ((start (point)))
-              (while (search-forward "<FRAME_SPLIT>\n" nil t)
-                (push (cons start (match-beginning 0)) offsets)
-                (when (looking-at "\n") (forward-char 1))
-                (setq start (point)))
-              (when (< start (point-max))
-                (push (cons start (point-max)) offsets)))
-            (with-current-buffer buf
-              (setq-local graph-fa2--frame-offsets (vconcat (nreverse offsets))))))))))
+        (let ((bg-size (with-current-buffer bg-buffer (buffer-size)))
+              (pb-size (with-current-buffer playback-buf (buffer-size))))
+          (when (> bg-size pb-size)
+            (with-current-buffer playback-buf
+              (let ((inhibit-read-only t)
+                    (new-offsets nil)
+                    (start-pos (1+ pb-size)))
+                (goto-char (point-max))
+                (insert-buffer-substring bg-buffer start-pos)
+                (goto-char start-pos)
+                (let ((start (point)))
+                  (while (search-forward "<FRAME_SPLIT>\n" nil t)
+                    (push (cons start (match-beginning 0)) new-offsets)
+                    (when (looking-at "\n") (forward-char 1))
+                    (setq start (point))))
+                (with-current-buffer buf
+                  (let ((old-offsets (append graph-fa2--frame-offsets nil)))
+                    (setq-local graph-fa2--frame-offsets (vconcat old-offsets (nreverse new-offsets))))
+                  (unless (and graph-fa2--drag-context
+                               (eq (cdr (assoc 'type graph-fa2--drag-context)) 'node-move))
+                    (graph-fa2-player-start)))))))))))
 
 (defun graph-fa2--render-chunk (ctx cache-file hash-file target-hash target-buf max-frames playback-fps)
-  "Cooperatively renders frames of the simulation in CTX and schedules the next chunk."
+  "Cooperatively render frames of the simulation and schedule the next chunk.
+
+If CACHE-FILE is nil, disk caching is skipped to keep interactive simulations
+purely in memory.
+
+Parameters:
+CTX: The simulation context.
+CACHE-FILE: Path to the cache output file.
+HASH-FILE: Path to the hash state file.
+TARGET-HASH: The hash string representing current graph contents.
+TARGET-BUF: The destination buffer.
+MAX-FRAMES: The simulation frame limit.
+PLAYBACK-FPS: Target frames per second.
+
+Returns:
+Nil."
   (let ((chunk-end-time (time-add nil 0.05))
         (slice-start-time (float-time))
         (slice-start-frames (graph-fa2-ctx-frames-rendered ctx))
@@ -697,23 +1001,28 @@ Synchronise buffers to state and trigger background rendering."
                     (ceiling (* max-frames (/ (- predicted-tg playback-ms) predicted-tg))))))
             (when (>= (graph-fa2-ctx-frames-rendered ctx) (+ 100 safe-buffer))
               (setf (graph-fa2-ctx-playback-started ctx) t)
-              (with-current-buffer (graph-fa2-ctx-bg-buffer ctx)
-                (let ((coding-system-for-write 'utf-8))
-                  (write-region (point-min) (point-max) cache-file nil 'silent)))
+              (when cache-file
+                (with-current-buffer (graph-fa2-ctx-bg-buffer ctx)
+                  (let ((coding-system-for-write 'utf-8))
+                    (write-region (point-min) (point-max) cache-file nil 'silent))))
               (when (buffer-live-p target-buf)
-                (graph-fa2--load-and-play target-buf cache-file)))))
+                (if cache-file
+                    (graph-fa2--load-and-play target-buf cache-file)
+                  (graph-fa2-player-start))))))
         (when (and (graph-fa2-ctx-playback-started ctx) (< (graph-fa2-ctx-frames-rendered ctx) max-frames))
           (graph-fa2--hot-reload-player target-buf (graph-fa2-ctx-bg-buffer ctx)))))
     (if (< (graph-fa2-ctx-frames-rendered ctx) max-frames)
         (setf (graph-fa2-ctx-bg-timer ctx)
               (run-at-time 0 nil #'graph-fa2--render-chunk ctx cache-file hash-file target-hash target-buf max-frames playback-fps))
-      (with-current-buffer (graph-fa2-ctx-bg-buffer ctx)
-        (let ((coding-system-for-write 'utf-8))
-          (write-region (point-min) (point-max) cache-file nil 'silent)))
-      (with-temp-file hash-file (insert target-hash))
-      (message "Background cache render complete.")
+      (when cache-file
+        (with-current-buffer (graph-fa2-ctx-bg-buffer ctx)
+          (let ((coding-system-for-write 'utf-8))
+            (write-region (point-min) (point-max) cache-file nil 'silent))))
+      (when hash-file
+        (with-temp-file hash-file (insert target-hash)))
       (when (and (buffer-live-p target-buf) (not (graph-fa2-ctx-playback-started ctx)))
-        (graph-fa2--load-and-play target-buf cache-file))
+        (when cache-file
+          (graph-fa2--load-and-play target-buf cache-file)))
       (kill-buffer (graph-fa2-ctx-bg-buffer ctx)))))
 
 (defun graph-fa2--zoom-tick (buffer)
@@ -741,28 +1050,46 @@ Synchronise buffers to state and trigger background rendering."
       (setq graph-fa2--zoom-timer
             (run-with-timer 0 0.016 #'graph-fa2--zoom-tick buf)))))
 
-(defun graph-fa2-zoom-in ()
+(defun graph-fa2-zoom-in (&optional event)
   "Increase the scale of the rendered graph with momentum."
-  (interactive)
-  (setq graph-fa2--zoom-velocity (+ graph-fa2--zoom-velocity graph-fa2-zoom-acceleration))
-  (graph-fa2--start-zoom-inertia))
+  (interactive (list last-input-event))
+  (let* ((posn (and (listp event) (event-start event)))
+         (window (and posn (posn-window posn))))
+    (if (and window (window-live-p window) (not (eq window (selected-window))))
+        (select-window window)
+      (when (eq (current-buffer) (window-buffer (selected-window)))
+        (setq graph-fa2--zoom-velocity (+ graph-fa2--zoom-velocity graph-fa2-zoom-acceleration))
+        (graph-fa2--start-zoom-inertia)))))
 
-(defun graph-fa2-zoom-out ()
+(defun graph-fa2-zoom-out (&optional event)
   "Decrease the scale of the rendered graph with momentum."
-  (interactive)
-  (setq graph-fa2--zoom-velocity (- graph-fa2--zoom-velocity graph-fa2-zoom-acceleration))
-  (graph-fa2--start-zoom-inertia))
+  (interactive (list last-input-event))
+  (let* ((posn (and (listp event) (event-start event)))
+         (window (and posn (posn-window posn))))
+    (if (and window (window-live-p window) (not (eq window (selected-window))))
+        (select-window window)
+      (when (eq (current-buffer) (window-buffer (selected-window)))
+        (setq graph-fa2--zoom-velocity (- graph-fa2--zoom-velocity graph-fa2-zoom-acceleration))
+        (graph-fa2--start-zoom-inertia)))))
 
 (defun graph-fa2-zoom-reset ()
-  "Reset the graph scale to default and kill any active momentum."
+  "Reset the graph scale and pan offsets to default and kill active momentum.
+
+Parameters:
+None.
+
+Returns:
+Nil."
   (interactive)
-  (setq graph-fa2--zoom-velocity 0.0)
-  (when graph-fa2--zoom-timer
-    (cancel-timer graph-fa2--zoom-timer)
-    (setq graph-fa2--zoom-timer nil))
-  
-  (setq graph-fa2--scale 1.0)
-  (graph-fa2--update-display))
+  (when (eq (current-buffer) (window-buffer (selected-window)))
+    (setq graph-fa2--zoom-velocity 0.0)
+    (when graph-fa2--zoom-timer
+      (cancel-timer graph-fa2--zoom-timer)
+      (setq graph-fa2--zoom-timer nil))
+    (setq graph-fa2--scale 1.0)
+    (setq graph-fa2--pan-x 0.0)
+    (setq graph-fa2--pan-y 0.0)
+    (graph-fa2--update-display)))
 
 (defun graph-fa2--grab-inner-elements (svg-string)
   "Extract the inner elements from SVG-STRING.
@@ -777,8 +1104,17 @@ be added directly during rendering."
         (substring svg-string start))))
    (t svg-string)))
 
-(defun graph-fa2--update-display (&rest _)
-  "Renders the current SVG frame into the buffer natively."
+(defun graph-fa2--update-display (&rest args)
+  "Render the current SVG frame into the buffer natively using window-specific overlays.
+This function checks for an existing overlay associated with the current window.
+If one does not exist, it creates the overlay and restricts its visibility
+to that window. This prevents frame lockups when multiple frames view the same buffer.
+
+Parameters:
+ARGS: Optional list of arguments (ignored).
+
+Returns:
+Nil."
   (when (and graph-fa2-current-svg (get-buffer-window (current-buffer) t))
     (let* ((inhibit-read-only t)
            (win (get-buffer-window (current-buffer) t))
@@ -786,8 +1122,8 @@ be added directly during rendering."
            (height (max 100 (window-pixel-height win)))
            (inner-elements (graph-fa2--grab-inner-elements graph-fa2-current-svg))
            (viewbox-dim (/ graph-fa2--canvas-size graph-fa2--scale))
-           (viewbox-x (- (/ graph-fa2--canvas-size 2.0) (/ viewbox-dim 2.0)))
-           (viewbox-y (- (/ graph-fa2--canvas-size 2.0) (/ viewbox-dim 2.0)))
+           (viewbox-x (- (- (/ graph-fa2--canvas-size 2.0) graph-fa2--pan-x) (/ viewbox-dim 2.0)))
+           (viewbox-y (- (- (/ graph-fa2--canvas-size 2.0) graph-fa2--pan-y) (/ viewbox-dim 2.0)))
            (full-svg (format "<svg width=\"%d\" height=\"%d\" viewBox=\"%.2f %.2f %.2f %.2f\" xmlns=\"http://www.w3.org/2000/svg\" preserveAspectRatio=\"xMidYMid meet\">\n%s\n</svg>"
                              width height viewbox-x viewbox-y viewbox-dim viewbox-dim inner-elements))
            (encoded-svg (if (multibyte-string-p full-svg)
@@ -795,31 +1131,42 @@ be added directly during rendering."
                           full-svg)))
       (clear-image-cache)
       (when (= (buffer-size) 0) (insert " "))
-
-      (add-text-properties 
-       (point-min) (point-max) 
-       (list 'display (create-image encoded-svg 'svg t)
-             'pointer (if graph-fa2-hovered-node 'hand nil)))
-
+      (remove-text-properties (point-min) (point-max) '(display nil pointer nil))
+      (let* ((overlays (overlays-in (point-min) (point-max)))
+             (ov (seq-find (lambda (o) (eq (overlay-get o 'window) win)) overlays)))
+        (unless ov
+          (setq ov (make-overlay (point-min) (point-max)))
+          (overlay-put ov 'window win))
+        (move-overlay ov (point-min) (point-max))
+        (overlay-put ov 'display (create-image encoded-svg 'svg t))
+        (overlay-put ov 'pointer (if graph-fa2-hovered-node 'hand nil)))
       (run-hooks 'graph-fa2-after-render-functions))))
 
 (defun graph-fa2--player-tick ()
-  "Advances the animation frame natively from either RAM or hidden buffers."
+  "Advance the animation frame natively from memory buffers.
+
+Parameters:
+None.
+
+Returns:
+Nil."
   (when (buffer-live-p (current-buffer))
-    (let ((total-frames (or (and graph-fa2--frame-offsets (length graph-fa2--frame-offsets)) 0)))
-      (when (> total-frames 0)
-        (if (< graph-fa2--current-frame total-frames)
-            (progn
-              (let ((bounds (when graph-fa2--frame-offsets 
-                              (aref graph-fa2--frame-offsets graph-fa2--current-frame))))
-                (setq graph-fa2-current-svg
-                      (if bounds
-                          (with-current-buffer graph-fa2-playback-buffer
-                            (buffer-substring-no-properties (car bounds) (cdr bounds)))
-                        nil)))
-              (graph-fa2--update-display)
-              (cl-incf graph-fa2--current-frame))
-          (graph-fa2-player-stop))))))
+    (unless (and graph-fa2--drag-context
+                 (eq (cdr (assoc 'type graph-fa2--drag-context)) 'node-move))
+      (let ((total-frames (or (and graph-fa2--frame-offsets (length graph-fa2--frame-offsets)) 0)))
+        (when (> total-frames 0)
+          (if (< graph-fa2--current-frame total-frames)
+              (progn
+                (let ((bounds (when graph-fa2--frame-offsets 
+                                (aref graph-fa2--frame-offsets graph-fa2--current-frame))))
+                  (setq graph-fa2-current-svg
+                        (if bounds
+                            (with-current-buffer graph-fa2-playback-buffer
+                              (buffer-substring-no-properties (car bounds) (cdr bounds)))
+                          nil)))
+                (graph-fa2--update-display)
+                (cl-incf graph-fa2--current-frame))
+            (graph-fa2-player-stop)))))))
 
 (defun graph-fa2-player-start ()
   "Starts the animation playback loop if frames are populated."
@@ -849,11 +1196,17 @@ be added directly during rendering."
   (let ((map (make-sparse-keymap)))
     (define-key map [mouse-movement] #'graph-fa2-track-mouse)
     (define-key map (kbd "<mouse-movement>") #'graph-fa2-track-mouse)
-    (define-key map [down-mouse-1] #'graph-fa2-click-node)
-    (define-key map (kbd "<down-mouse-1>") #'graph-fa2-click-node)
+    (define-key map [down-mouse-1] #'graph-fa2-mouse-down)
+    (define-key map (kbd "<down-mouse-1>") #'graph-fa2-mouse-down)
+    (define-key map [drag-mouse-1] #'graph-fa2-mouse-up)
+    (define-key map (kbd "<drag-mouse-1>") #'graph-fa2-mouse-up)
+    (define-key map [mouse-1] #'graph-fa2-mouse-up)
+    (define-key map (kbd "<mouse-1>") #'graph-fa2-mouse-up)
     (define-key map (kbd "+") #'graph-fa2-zoom-in)
     (define-key map (kbd "-") #'graph-fa2-zoom-out)
     (define-key map (kbd "0") #'graph-fa2-zoom-reset)
+    (define-key map (kbd "w") #'graph-fa2-open-in-new-window)
+    (define-key map (kbd "f") #'graph-fa2-open-in-new-frame)
     (define-key map (kbd "<wheel-up>") #'graph-fa2-zoom-in)
     (define-key map (kbd "<wheel-down>") #'graph-fa2-zoom-out)
     map)
@@ -866,10 +1219,74 @@ be added directly during rendering."
   (if graph-fa2-mode
       (progn
         (setq-local track-mouse t)
-        (add-hook 'window-size-change-functions #'graph-fa2--update-display nil t))
+        (add-hook 'window-size-change-functions #'graph-fa2--update-display nil t)
+        (add-hook 'window-selection-change-functions #'graph-fa2--cancel-drag nil t)
+        (add-hook 'focus-out-hook #'graph-fa2--cancel-drag nil t))
     (progn
       (setq-local track-mouse nil)
-      (remove-hook 'window-size-change-functions #'graph-fa2--update-display t))))
+      (remove-hook 'window-size-change-functions #'graph-fa2--update-display t)
+      (remove-hook 'window-selection-change-functions #'graph-fa2--cancel-drag t)
+      (remove-hook 'focus-out-hook #'graph-fa2--cancel-drag t)
+      (let ((overlays (overlays-in (point-min) (point-max))))
+        (dolist (o overlays)
+          (when (overlay-get o 'window)
+            (delete-overlay o)))))))
+
+(defun graph-fa2-view-indirect (&optional frame)
+  "Spawn an indirect buffer for the current graph and display it.
+This ensures each window or frame has its own independent view with its own
+zoom scale, pan offsets, and active hitboxes, resolving frame lockups.
+
+Parameters:
+FRAME: If non-nil, display in a new frame. Otherwise, display in a new window.
+
+Returns:
+The newly created indirect buffer."
+  (interactive "P")
+  (let* ((base-buf (current-buffer))
+         (indirect-name (generate-new-buffer-name (concat (buffer-name base-buf) "-view")))
+         (indirect-buf (make-indirect-buffer base-buf indirect-name t)))
+    (with-current-buffer indirect-buf
+      (graph-fa2-mode 1)
+      (setq-local graph-fa2--scale (buffer-local-value 'graph-fa2--scale base-buf))
+      (setq-local graph-fa2--pan-x (buffer-local-value 'graph-fa2--pan-x base-buf))
+      (setq-local graph-fa2--pan-y (buffer-local-value 'graph-fa2--pan-y base-buf))
+      (setq-local graph-fa2--active-hitboxes (buffer-local-value 'graph-fa2--active-hitboxes base-buf))
+      (setq-local graph-fa2-current-svg (buffer-local-value 'graph-fa2-current-svg base-buf))
+      (setq-local graph-fa2-ctx (buffer-local-value 'graph-fa2-ctx base-buf))
+      (setq-local graph-fa2-playback-buffer (buffer-local-value 'graph-fa2-playback-buffer base-buf)))
+    (if frame
+        (let ((win (frame-selected-window (make-frame))))
+          (set-window-buffer win indirect-buf)
+          indirect-buf)
+      (pop-to-buffer indirect-buf))
+    indirect-buf))
+
+(defun graph-fa2-open-in-new-window ()
+  "Open the current graph in a new window using an indirect buffer.
+This avoids sharing display properties across windows and frames,
+eliminating lockups.
+
+Parameters:
+None.
+
+Returns:
+The newly created indirect buffer."
+  (interactive)
+  (graph-fa2-view-indirect nil))
+
+(defun graph-fa2-open-in-new-frame ()
+  "Open the current graph in a new frame using an indirect buffer.
+This avoids sharing display properties across windows and frames,
+eliminating lockups.
+
+Parameters:
+None.
+
+Returns:
+The newly created indirect buffer."
+  (interactive)
+  (graph-fa2-view-indirect t))
 
 (defun graph-fa2--load-and-play (buf cache-file)
   "Streams the fully computed cache file back to the Emacs frontend."
@@ -916,8 +1333,18 @@ This guarantees deterministic JSON encoding across different Emacs versions."
 ;;;###autoload
 (cl-defun graph-fa2-start (buf nodes edges &key cache-dir)
   "Initialise the cooperative physics background worker or load from cache.
-This creates the context struct, sets up the background buffer, pre-allocates vectors,
-and starts the rendering thread."
+
+Creates the context structure from the provided properties, configures
+the pre-allocated arrays, and starts the asynchronous rendering thread.
+
+Parameters:
+BUF: The buffer displaying the graph.
+NODES: List of graph nodes.
+EDGES: List of graph edges.
+CACHE-DIR: Directory for storing cache files (optional).
+
+Returns:
+Nil."
   (let* ((resolved-cache-dir (or cache-dir (expand-file-name "graph-fa2-cache" temporary-file-directory)))
          (hash-file (expand-file-name "fa2-graph.hash" resolved-cache-dir))
          (data-file (expand-file-name "fa2-graph.dat" resolved-cache-dir))
@@ -932,23 +1359,25 @@ and starts the rendering thread."
                           (string-trim (buffer-string))))))
     (unless (file-exists-p resolved-cache-dir)
       (make-directory resolved-cache-dir t))
-    (if (and cached-hash (string= current-hash cached-hash) (file-exists-p data-file))
-        (progn
-          (message "Loading cached graph...")
-          (graph-fa2--load-and-play buf data-file))
-      (message "Rendering cache cooperatively (streaming to UI)...")
-      (let ((old-ctx (with-current-buffer buf (and (boundp 'graph-fa2-ctx) graph-fa2-ctx))))
-        (when old-ctx
-          (when (graph-fa2-ctx-bg-timer old-ctx)
-            (cancel-timer (graph-fa2-ctx-bg-timer old-ctx)))
-          (when (buffer-live-p (graph-fa2-ctx-bg-buffer old-ctx))
-            (kill-buffer (graph-fa2-ctx-bg-buffer old-ctx)))))
-      (let ((ctx (graph-fa2--create-ctx nodes edges)))
-        (with-current-buffer buf
-          (setq-local graph-fa2-ctx ctx))
+    
+    (let ((old-ctx (with-current-buffer buf (and (boundp 'graph-fa2-ctx) graph-fa2-ctx))))
+      (when old-ctx
+        (when (graph-fa2-ctx-bg-timer old-ctx)
+          (cancel-timer (graph-fa2-ctx-bg-timer old-ctx)))
+        (when (buffer-live-p (graph-fa2-ctx-bg-buffer old-ctx))
+          (kill-buffer (graph-fa2-ctx-bg-buffer old-ctx)))))
+
+    (let ((ctx (graph-fa2--create-ctx nodes edges)))
+      (with-current-buffer buf
+        (setq-local graph-fa2-ctx ctx))
+      
+      (if (and cached-hash (string= current-hash cached-hash) (file-exists-p data-file))
+          (graph-fa2--load-and-play buf data-file)
         (setf (graph-fa2-ctx-bg-buffer ctx) (generate-new-buffer " *graph-fa2-bg*"))
         (setf (graph-fa2-ctx-bg-timer ctx)
-              (run-at-time 0 nil #'graph-fa2--render-chunk ctx data-file hash-file current-hash buf graph-fa2-simulation-frames graph-fa2-framerate))))))
+              (run-at-time 0 nil #'graph-fa2--render-chunk 
+                           ctx data-file hash-file current-hash buf 
+                           graph-fa2-simulation-frames graph-fa2-framerate))))))
 
 ;;;###autoload
 (defun graph-fa2-clear-cache (&optional cache-dir)
