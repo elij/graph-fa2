@@ -2,6 +2,8 @@
 
 https://github.com/user-attachments/assets/6bdd8aac-201b-49d2-82eb-4d555d665437
 
+*the engine defaults to 3d use `graph-fa2-engine` to change to 2d*
+
 Optimised ForceAtlas2 simulation using librsvg to allow dynamic graphs directly within emacs buffers without a browser engine.
 
 ## Use cases
