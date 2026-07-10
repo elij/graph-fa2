@@ -72,6 +72,44 @@ Lower is more friction (stops faster), higher is 'slippery'."
   :type 'float
   :group 'graph-fa2)
 
+(defcustom graph-fa2-edge-colour "#585b70"
+  "Stroke colour, as a hex string, for graph edges."
+  :type 'string
+  :group 'graph-fa2)
+
+(defcustom graph-fa2-edge-width 2
+  "Stroke width, in SVG units, for graph edges."
+  :type 'number
+  :group 'graph-fa2)
+
+(defcustom graph-fa2-label-colour "#cdd6f4"
+  "Fill colour, as a hex string, for node label text."
+  :type 'string
+  :group 'graph-fa2)
+
+(defcustom graph-fa2-label-font-size 10
+  "Font size, in SVG units, for node label text.
+Line spacing scales with this value."
+  :type 'number
+  :group 'graph-fa2)
+
+(defcustom graph-fa2-label-font-family nil
+  "Font family for node label text, or nil to use the renderer default.
+When non-nil, emitted as the SVG font-family attribute (e.g. \"sans-serif\")."
+  :type '(choice (const :tag "Renderer default" nil) string)
+  :group 'graph-fa2)
+
+(defcustom graph-fa2-label-font-weight nil
+  "Font weight for node label text, or nil to use the renderer default.
+When non-nil, emitted as the SVG font-weight attribute (e.g. \"bold\")."
+  :type '(choice (const :tag "Renderer default" nil) string)
+  :group 'graph-fa2)
+
+(defcustom graph-fa2-label-wrap-chars 10
+  "Maximum number of characters per line before a node label wraps."
+  :type 'integer
+  :group 'graph-fa2)
+
 (defvar-local graph-fa2-node-clicked-functions nil
   "List of functions to be called when a graph node is clicked.
 Each function must accept one argument: the node identifier.")
@@ -876,7 +914,7 @@ garbage collection pressure during background rendering."
                    (uy (number-to-string (+ (ash (truncate (aref pos-y u-idx)) -8) half-canvas)))
                    (vx (number-to-string (+ (ash (truncate (aref pos-x v-idx)) -8) half-canvas)))
                    (vy (number-to-string (+ (ash (truncate (aref pos-y v-idx)) -8) half-canvas))))
-              (insert "  <line x1=\"" ux "\" y1=\"" uy "\" x2=\"" vx "\" y2=\"" vy "\" stroke=\"#585b70\" stroke-width=\"2\" />\n"))))
+              (insert "  <line x1=\"" ux "\" y1=\"" uy "\" x2=\"" vx "\" y2=\"" vy "\" stroke=\"" graph-fa2-edge-colour "\" stroke-width=\"" (number-to-string graph-fa2-edge-width) "\" />\n"))))
         (dotimes (i len)
           (let* ((n (aref nodes i))
                  (nx-int (+ (ash (truncate (aref pos-x i)) -8) half-canvas))
@@ -888,11 +926,17 @@ garbage collection pressure during background rendering."
                  (radius (fa2-radius n))
                  (colour (fa2-colour n))
                  (name-escaped (graph-fa2--escape-xml label))
-                 (lines (graph-fa2--wrap-text name-escaped 10))
-                 (line-height 12)
+                 (lines (graph-fa2--wrap-text name-escaped graph-fa2-label-wrap-chars))
+                 (line-height (max 1 (round (* graph-fa2-label-font-size 1.2))))
                  (start-y (- ny-int 15 (* (1- (length lines)) (/ line-height 2)))))
             (insert "  <circle cx=\"" nx "\" cy=\"" ny "\" r=\"" (number-to-string radius) "\" fill=\"" colour "\" data-name=\"" (graph-fa2--escape-xml id) "\" />\n")
-            (insert "  <text fill=\"#cdd6f4\" font-size=\"10\" text-anchor=\"middle\">\n")
+            (insert "  <text fill=\"" graph-fa2-label-colour
+                    "\" font-size=\"" (number-to-string graph-fa2-label-font-size) "\""
+                    (if graph-fa2-label-font-family
+                        (concat " font-family=\"" graph-fa2-label-font-family "\"") "")
+                    (if graph-fa2-label-font-weight
+                        (concat " font-weight=\"" graph-fa2-label-font-weight "\"") "")
+                    " text-anchor=\"middle\">\n")
             (let ((curr-y start-y))
               (dolist (line lines)
                 (insert "    <tspan x=\"" nx "\" y=\"" (number-to-string curr-y) "\">" line "</tspan>\n")
