@@ -11,6 +11,12 @@ Optimised ForceAtlas2 simulation using librsvg to allow dynamic graphs directly 
 - Observability (graphs of sub agents in [`macher-agent`](https://github.com/elij/macher-agent))
 - Knowledge Graph (used to render the `grove` graph in [`grove-extra`](https://github.com/elij/grove-extra))
 
+## Customisations
+
+https://github.com/user-attachments/assets/1c79973a-973a-4ba0-9a48-6c8ad87ed54f
+
+[@yuruyurau](https://bsky.app/profile/yuruyurau.bsky.social/post/3mq7wcge7bs24) inspired visualisation
+
 ## Features
 
 - Momentum zoom
