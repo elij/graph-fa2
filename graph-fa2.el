@@ -3,7 +3,7 @@
 ;; Author: Elijah Charles <https://github.com/elij>
 ;; URL: https://github.com/elij/graph-fa2
 ;; Keywords: multimedia, graphs, visualization
-;; Version: 0.2.4
+;; Version: 0.2.3
 ;; Package-Requires: ((emacs "27.1"))
 ;; SPDX-License-Identifier: GPL-3.0-or-later
 
@@ -508,15 +508,13 @@ Returns TO-STATE."
       ('pending-drag
        (when payload
          (setq graph-fa2--drag-context payload)))
-      ('dragging-node
+      ((or 'dragging-node 'dragging-viewport)
        (let* ((base-buf (or (buffer-base-buffer) (current-buffer)))
               (is-playing (or graph-fa2--player-timer
                               (buffer-local-value 'graph-fa2--player-timer base-buf))))
          (unless is-playing
            (when-let* ((ctx (graph-fa2--discover-context base-buf)))
              (graph-fa2--sync-physics ctx graph-fa2--active-hitboxes)))))
-      ('dragging-viewport
-       nil)
       ('zooming
        (setq graph-fa2--drag-context nil)))
     to-state))
@@ -1928,7 +1926,7 @@ Nil."
                   (if-let* ((has-cache cache-file))
                       (graph-fa2--load-playback-from-cache ctx cache-file target-buf)
                     (graph-fa2-player-start))))))
-          (when-let* ((can-reload (and playback-started (< frames-rendered max-frames))))
+          (when-let* ((can-reload (and playback-started (<= frames-rendered max-frames))))
             (graph-fa2--hot-reload-player target-buf bg-buffer)))
         (if-let*
             ((continue-sim (< frames-rendered max-frames)))
