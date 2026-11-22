@@ -21,7 +21,7 @@ The layout engine uses high-precision fixed-point integer arithmetic and pre-all
 ### Related projects
 
 - [vulpea-graph](https://github.com/neonmei/vulpea-graph)
-- [grove-extra](https://github.com/elij/grove-extra)
+- [pnotes](https://github.com/elij/pnotes)
 
 ## Physics engine architecture
 
